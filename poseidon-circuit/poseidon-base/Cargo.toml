@@ -1,0 +1,21 @@
+[package]
+name = "poseidon-base"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lazy_static.workspace = true
+bitvec.workspace = true
+halo2curves.workspace = true
+once_cell.workspace = true
+
+subtle = { workspace = true, optional = true}
+
+[dev-dependencies]
+subtle.workspace = true
+
+[features]
+default = ["short"]
+short = []
+test = ["subtle"]
+legacy = []

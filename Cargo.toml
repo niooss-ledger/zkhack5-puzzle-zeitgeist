@@ -1,0 +1,22 @@
+[package]
+name = "zkhack-V-1"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# halo2_proofs = { git = "https://github.com/scroll-tech/halo2.git", branch = "v1.0" }
+halo2_proofs = { path = "./halo2/halo2_proofs" }
+# halo2_proofs = { git = "https://github.com/scroll-tech/halo2.git" }
+poseidon-base = { path = "./poseidon-circuit/poseidon-base" }
+poseidon-circuit = { path = "./poseidon-circuit/poseidon-circuit" }
+
+
+halo2curves = { version = "0.1.0", features = [ "derive_serde" ] }
+rand_core = { version = "0.6", default-features = false }
+rand_chacha = "0.3"
+prompt = { git = "https://github.com/kobigurk/zkhack-prompt" }
+
+# [patch."https://github.com/privacy-scaling-explorations/halo2.git"]
+# halo2_proofs = { git = "https://github.com/scroll-tech/halo2.git", branch = "v1.0" }
