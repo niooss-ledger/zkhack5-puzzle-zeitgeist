@@ -437,3 +437,218 @@ where
             .map_err(|_| Error::Opening)
     })
 }
+
+/// Patched version of verify_proof from
+/// https://github.com/ZK-Hack/puzzle-zeitgeist/blob/5bf6b2a8ac81f228c1d316bc34b5517a0c122f62/halo2/halo2_proofs/src/plonk/verifier.rs#L24-L230
+pub fn extract_info_from_proof<
+    'params,
+    Scheme: CommitmentScheme,
+    V: Verifier<'params, Scheme>,
+    E: EncodedChallenge<Scheme::Curve>,
+    T: TranscriptRead<Scheme::Curve, E>,
+    Strategy: VerificationStrategy<'params, Scheme, V>,
+>(
+    params: &'params Scheme::ParamsVerifier,
+    vk: &VerifyingKey<Scheme::Curve>,
+    strategy: Strategy,
+    instances: &[&[&[Scheme::Scalar]]],
+    transcript: &mut T,
+) -> Result<(Scheme::Scalar, Scheme::Scalar), Error>
+where
+    Scheme::Scalar: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
+{
+    // Check that instances matches the expected number of instance columns
+    for instances in instances.iter() {
+        if instances.len() != vk.cs.num_instance_columns {
+            return Err(Error::InvalidInstances);
+        }
+    }
+
+    let instance_commitments = if V::QUERY_INSTANCE {
+        instances
+            .iter()
+            .map(|instance| {
+                instance
+                    .iter()
+                    .map(|instance| {
+                        if instance.len() > params.n() as usize - (vk.cs.blinding_factors() + 1) {
+                            return Err(Error::InstanceTooLarge);
+                        }
+                        let mut poly = instance.to_vec();
+                        poly.resize(params.n() as usize, Scheme::Scalar::ZERO);
+                        let poly = vk.domain.lagrange_from_vec(poly);
+
+                        Ok(params.commit_lagrange(&poly, Blind::default()).to_affine())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![vec![]; instances.len()]
+    };
+
+    let num_proofs = instance_commitments.len();
+
+    // Hash verification key into transcript
+    vk.hash_into(transcript)?;
+
+    if V::QUERY_INSTANCE {
+        for instance_commitments in instance_commitments.iter() {
+            // Hash the instance (external) commitments into the transcript
+            for commitment in instance_commitments {
+                transcript.common_point(*commitment)?
+            }
+        }
+    } else {
+        for instance in instances.iter() {
+            for instance in instance.iter() {
+                for value in instance.iter() {
+                    transcript.common_scalar(*value)?;
+                }
+            }
+        }
+    }
+
+    // Hash the prover's advice commitments into the transcript and squeeze challenges
+    let (advice_commitments, challenges) = {
+        let mut advice_commitments =
+            vec![vec![Scheme::Curve::default(); vk.cs.num_advice_columns]; num_proofs];
+        let mut challenges = vec![Scheme::Scalar::ZERO; vk.cs.num_challenges];
+
+        for current_phase in vk.cs.phases() {
+            for advice_commitments in advice_commitments.iter_mut() {
+                for (phase, commitment) in vk
+                    .cs
+                    .advice_column_phase
+                    .iter()
+                    .zip(advice_commitments.iter_mut())
+                {
+                    if current_phase == *phase {
+                        *commitment = transcript.read_point()?;
+                    }
+                }
+            }
+            for (phase, challenge) in vk.cs.challenge_phase.iter().zip(challenges.iter_mut()) {
+                if current_phase == *phase {
+                    *challenge = *transcript.squeeze_challenge_scalar::<()>();
+                }
+            }
+        }
+
+        (advice_commitments, challenges)
+    };
+
+    // Sample theta challenge for keeping lookup columns linearly independent
+    let theta: ChallengeTheta<_> = transcript.squeeze_challenge_scalar();
+
+    let lookups_prepared = (0..num_proofs)
+        .map(|_| -> Result<Vec<_>, _> {
+            // Hash each lookup prepared commitment
+            vk.cs
+                .lookups
+                .iter()
+                .map(|argument| argument.read_prepared_commitments(transcript))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Sample beta challenge
+    let beta: ChallengeBeta<_> = transcript.squeeze_challenge_scalar();
+
+    // Sample gamma challenge
+    let gamma: ChallengeGamma<_> = transcript.squeeze_challenge_scalar();
+
+    let permutations_committed = (0..num_proofs)
+        .map(|_| {
+            // Hash each permutation product commitment
+            vk.cs.permutation.read_product_commitments(vk, transcript)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let lookups_committed = lookups_prepared
+        .into_iter()
+        .map(|lookups| {
+            // Hash each lookup sum commitment
+            lookups
+                .into_iter()
+                .map(|lookup| lookup.read_grand_sum_commitment(transcript))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let shuffles_committed = (0..num_proofs)
+        .map(|_| -> Result<Vec<_>, _> {
+            // Hash each shuffle product commitment
+            vk.cs
+                .shuffles
+                .iter()
+                .map(|argument| argument.read_product_commitment(transcript))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let vanishing = vanishing::Argument::read_commitments_before_y(transcript)?;
+
+    // Sample y challenge, which keeps the gates linearly independent.
+    let y: ChallengeY<_> = transcript.squeeze_challenge_scalar();
+
+    let vanishing = vanishing.read_commitments_after_y(vk, transcript)?;
+
+    // Sample x challenge, which is used to ensure the circuit is
+    // satisfied with high probability.
+    let x: ChallengeX<_> = transcript.squeeze_challenge_scalar();
+    let instance_evals = if V::QUERY_INSTANCE {
+        (0..num_proofs)
+            .map(|_| -> Result<Vec<_>, _> {
+                read_n_scalars(transcript, vk.cs.instance_queries.len())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let xn = x.pow([params.n()]);
+        let (min_rotation, max_rotation) =
+            vk.cs
+                .instance_queries
+                .iter()
+                .fold((0, 0), |(min, max), (_, rotation)| {
+                    if rotation.0 < min {
+                        (rotation.0, max)
+                    } else if rotation.0 > max {
+                        (min, rotation.0)
+                    } else {
+                        (min, max)
+                    }
+                });
+        let max_instance_len = instances
+            .iter()
+            .flat_map(|instance| instance.iter().map(|instance| instance.len()))
+            .max_by(Ord::cmp)
+            .unwrap_or_default();
+        let l_i_s = &vk.domain.l_i_range(
+            *x,
+            xn,
+            -max_rotation..max_instance_len as i32 + min_rotation.abs(),
+        );
+        instances
+            .iter()
+            .map(|instances| {
+                vk.cs
+                    .instance_queries
+                    .iter()
+                    .map(|(column, rotation)| {
+                        let instances = instances[column.index()];
+                        let offset = (max_rotation - rotation.0) as usize;
+                        compute_inner_product(instances, &l_i_s[offset..offset + instances.len()])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let advice_evals = (0..num_proofs)
+        .map(|_| -> Result<Vec<_>, _> { read_n_scalars(transcript, vk.cs.advice_queries.len()) })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Extract advice_evals[1]
+    Ok((*x, advice_evals[0][1]))
+}
+

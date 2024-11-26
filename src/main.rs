@@ -4,8 +4,7 @@ use halo2_proofs::arithmetic::PrimeField;
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{
     create_proof as create_plonk_proof, keygen_pk, keygen_vk, verify_proof as verify_plonk_proof,
-    Advice, Circuit, Column, ConstraintSystem, Error, Fixed, ProvingKey,
-    VerifyingKey, Instance
+    Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance, ProvingKey, VerifyingKey,
 };
 use halo2_proofs::poly::commitment::{CommitmentScheme, ParamsProver, Prover, Verifier};
 use halo2_proofs::poly::VerificationStrategy;
@@ -20,8 +19,8 @@ use rand_core::{OsRng, RngCore, SeedableRng};
 use std::marker::PhantomData;
 
 use halo2_proofs::circuit::AssignedCell;
-use rand_chacha::ChaCha20Rng;
 use halo2_proofs::circuit::Chip;
+use rand_chacha::ChaCha20Rng;
 
 use halo2curves::ff::Field;
 use poseidon_base::primitives::ConstantLength;
@@ -30,7 +29,6 @@ use poseidon_base::primitives::P128Pow5T3Compact;
 use poseidon_circuit::poseidon::Hash;
 use poseidon_circuit::poseidon::Pow5Chip;
 use poseidon_circuit::poseidon::Pow5Config;
-
 
 trait LoadingInstructions<F: PrimeField>: Chip<F> {
     type Num;
@@ -283,7 +281,6 @@ impl Circuit<Fr> for MyCircuit {
         Ok(())
     }
 }
-
 
 const K: u32 = 6;
 
@@ -538,10 +535,95 @@ pub fn main() {
 
     /* This is how the serialized proofs, nullifiers and commitments were created. */
     // serialize();
+    {
+        use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+        use halo2_proofs::poly::kzg::multiopen::VerifierSHPLONK;
+        use halo2_proofs::poly::kzg::strategy::AccumulatorStrategy;
+        use halo2curves::bn256::Bn256;
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::SeedableRng;
+
+        pub fn extract_info_from_proof<
+            'a,
+            'params,
+            Scheme: CommitmentScheme<Scalar = halo2curves::bn256::Fr>,
+            V: Verifier<'params, Scheme>,
+            E: EncodedChallenge<Scheme::Curve>,
+            T: TranscriptReadBuffer<&'a [u8], Scheme::Curve, E>,
+            Strategy: VerificationStrategy<'params, Scheme, V, Output = Strategy>,
+        >(
+            params_verifier: &'params Scheme::ParamsVerifier,
+            vk: &VerifyingKey<Scheme::Curve>,
+            proof: &'a [u8],
+            nullifier: Fr,
+            commitment: Fr,
+        ) -> (Fr, Fr)
+        where
+            Scheme::Scalar: Ord + WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
+        {
+            let pubinputs = vec![nullifier, commitment];
+
+            let mut transcript = T::init(proof);
+
+            let strategy = Strategy::new(params_verifier);
+            halo2_proofs::plonk::verifier::extract_info_from_proof(
+                params_verifier,
+                vk,
+                strategy,
+                &[&[&pubinputs[..]]],
+                &mut transcript,
+            )
+            .unwrap()
+        }
+
+        let setup_rng = ChaCha20Rng::from_seed([1u8; 32]);
+        let params = ParamsKZG::<Bn256>::setup(K, setup_rng);
+        let pk = keygen::<KZGCommitmentScheme<_>>(&params);
+        let verifier_params = params.verifier_params();
+
+        // Extract the evaluations of advice[0].advice_polys[1]
+        let mut extracted_evals = Vec::new();
+        for i in 0..64 {
+            let (proof, nullifier, commitment) = from_serialized(i);
+
+            let (x, eval_at_x) =
+                extract_info_from_proof::<
+                    _,
+                    VerifierSHPLONK<_>,
+                    _,
+                    Blake2bRead<_, _, Challenge255<_>>,
+                    AccumulatorStrategy<_>,
+                >(verifier_params, pk.get_vk(), &proof, nullifier, commitment);
+            println!("extracted[{i}]: x = {x:?}, e = {eval_at_x:?}");
+            extracted_evals.push((x, eval_at_x))
+        }
+
+        // Interpolate the polynomial at omega^2
+        let omega2 = pk.get_vk().get_domain().get_omega().square();
+        let mut secret = Fr::zero();
+        for i in 0..64 {
+            let mut term = extracted_evals[i].1;
+            for j in 0..64 {
+                if i != j {
+                    term *= omega2 - extracted_evals[j].0;
+                    term *= (extracted_evals[i].0 - extracted_evals[j].0)
+                        .invert()
+                        .unwrap();
+                }
+            }
+            secret += term;
+        }
+        println!("secret = {secret:?}");
+
+        // Try to debug proof creation
+    }
 
     /* Implement your attack here, to find the index of the encrypted message */
 
-    let secret = Fr::from(0u64);
+    let secret = Fr::from_str_vartime(
+        "2902393715628053125157988380733315934099850103804946746061390165677120635277",
+    )
+    .unwrap();
     let secret_commitment = poseidon_base::primitives::Hash::<
         _,
         P128Pow5T3Compact<Fr>,

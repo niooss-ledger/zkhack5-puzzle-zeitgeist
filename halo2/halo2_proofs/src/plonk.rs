@@ -30,7 +30,7 @@ mod shuffle;
 mod vanishing;
 
 mod prover;
-mod verifier;
+pub mod verifier;
 
 pub use assigned::*;
 pub use circuit::*;
