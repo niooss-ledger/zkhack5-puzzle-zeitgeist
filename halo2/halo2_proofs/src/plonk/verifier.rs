@@ -453,7 +453,7 @@ pub fn extract_info_from_proof<
     strategy: Strategy,
     instances: &[&[&[Scheme::Scalar]]],
     transcript: &mut T,
-) -> Result<(Scheme::Scalar, Scheme::Scalar), Error>
+) -> Result<(Scheme::Scalar, Vec<Scheme::Scalar>), Error>
 where
     Scheme::Scalar: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
 {
@@ -648,7 +648,6 @@ where
         .map(|_| -> Result<Vec<_>, _> { read_n_scalars(transcript, vk.cs.advice_queries.len()) })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Extract advice_evals[1]
-    Ok((*x, advice_evals[0][1]))
+    // Extract advice_evals for the first proof
+    Ok((*x, advice_evals[0].clone()))
 }
-

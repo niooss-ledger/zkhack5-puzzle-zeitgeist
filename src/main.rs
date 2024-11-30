@@ -529,6 +529,47 @@ pub fn deserialize() -> (Vec<Vec<u8>>, Vec<Fr>, Vec<Fr>) {
     (proofs, nullifiers, commitments)
 }
 
+/// Compute the Poseidon hash of [a, b]
+fn poseidon_hash2(a: Fr, b: Fr) -> Fr {
+    poseidon_base::primitives::Hash::<
+        _,
+        P128Pow5T3Compact<Fr>,
+        ConstantLength<2>,
+        WIDTH,
+        RATE,
+    >::init()
+    .hash([a, b])
+}
+
+fn create_test_proof() {
+    use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+    use halo2_proofs::poly::kzg::multiopen::ProverSHPLONK;
+    use halo2curves::bn256::Bn256;
+
+    let secret = Fr::from(0x5ecc0de_u64);
+    let nonce = Fr::from(0xace_u64);
+    let nullifier = poseidon_hash2(secret, nonce);
+    let commitment = poseidon_hash2(secret, Fr::from(0));
+
+    let setup_rng = ChaCha20Rng::from_seed([1u8; 32]);
+    let params = ParamsKZG::<Bn256>::setup(K, setup_rng);
+    let pk = keygen::<KZGCommitmentScheme<_>>(&params);
+    let circuit = MyCircuit {
+        witness: Value::known(secret),
+        nonce: Value::known(nonce),
+    };
+    let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+    create_plonk_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<_>, _, _, _, _>(
+        &params,
+        &pk,
+        &[circuit],
+        &[&[&[nullifier, commitment]]],
+        rand_chacha::ChaCha20Rng::from_seed([42u8; 32]),
+        &mut transcript,
+    )
+    .expect("proof generation should not fail");
+}
+
 pub fn main() {
     welcome();
     puzzle(PUZZLE_DESCRIPTION);
@@ -538,6 +579,8 @@ pub fn main() {
 
     /* Implement your attack here, to find the index of the encrypted message */
 
+    create_test_proof();
+
     use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
     use halo2_proofs::poly::kzg::multiopen::VerifierSHPLONK;
     use halo2_proofs::poly::kzg::strategy::AccumulatorStrategy;
@@ -545,76 +588,91 @@ pub fn main() {
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
 
-    pub fn extract_info_from_proof<
-        'a,
-        'params,
-        Scheme: CommitmentScheme<Scalar = halo2curves::bn256::Fr>,
-        V: Verifier<'params, Scheme>,
-        E: EncodedChallenge<Scheme::Curve>,
-        T: TranscriptReadBuffer<&'a [u8], Scheme::Curve, E>,
-        Strategy: VerificationStrategy<'params, Scheme, V, Output = Strategy>,
-    >(
-        params_verifier: &'params Scheme::ParamsVerifier,
-        vk: &VerifyingKey<Scheme::Curve>,
-        proof: &'a [u8],
-        nullifier: Fr,
-        commitment: Fr,
-    ) -> (Fr, Fr)
-    where
-        Scheme::Scalar: Ord + WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
-    {
-        let pubinputs = vec![nullifier, commitment];
-
-        let mut transcript = T::init(proof);
-
-        let strategy = Strategy::new(params_verifier);
-        halo2_proofs::plonk::verifier::extract_info_from_proof(
-            params_verifier,
-            vk,
-            strategy,
-            &[&[&pubinputs[..]]],
-            &mut transcript,
-        )
-        .unwrap()
-    }
-
     let setup_rng = ChaCha20Rng::from_seed([1u8; 32]);
     let params = ParamsKZG::<Bn256>::setup(K, setup_rng);
     let pk = keygen::<KZGCommitmentScheme<_>>(&params);
-    let verifier_params = params.verifier_params();
 
     // Extract the evaluations of advice[0].advice_polys[1]
-    let mut extracted_evals = Vec::new();
+    let mut xs = Vec::new();
+    let mut evals = Vec::new();
+    let (proofs, nullifiers, commitments) = deserialize();
     for i in 0..64 {
-        let (proof, nullifier, commitment) = from_serialized(i);
-
-        let (x, eval_at_x) = extract_info_from_proof::<
+        let (x, evals_at_x) = halo2_proofs::plonk::verifier::extract_info_from_proof::<
             _,
             VerifierSHPLONK<_>,
             _,
-            Blake2bRead<_, _, Challenge255<_>>,
-            AccumulatorStrategy<_>,
-        >(verifier_params, pk.get_vk(), &proof, nullifier, commitment);
-        println!("extracted[{i}]: x = {x:?}, e = {eval_at_x:?}");
-        extracted_evals.push((x, eval_at_x))
+            _,
+            _,
+        >(
+            params.verifier_params(),
+            pk.get_vk(),
+            AccumulatorStrategy::new(params.verifier_params()),
+            &[&[&[nullifiers[i], commitments[i]]]],
+            &mut Blake2bRead::<_, _, Challenge255<_>>::init(proofs[i].as_slice()),
+        )
+        .unwrap();
+        let px = evals_at_x[1];
+        println!("extracted[{i}]: x = {x:?}, P(x) = {px:?}");
+        xs.push(x);
+        evals.push(px);
     }
 
     // Interpolate the polynomial at omega^2
     let omega2 = pk.get_vk().get_domain().get_omega().square();
     let mut secret = Fr::zero();
     for i in 0..64 {
-        let mut term = extracted_evals[i].1;
+        let mut term = evals[i];
         for j in 0..64 {
             if i != j {
-                term *= omega2 - extracted_evals[j].0;
-                term *= (extracted_evals[i].0 - extracted_evals[j].0)
-                    .invert()
-                    .unwrap();
+                term *= (omega2 - xs[j]) * (xs[i] - xs[j]).invert().unwrap();
             }
         }
         secret += term;
     }
     println!("secret = {secret:?}");
+
+    // Another possibility: use lagrange interpolation directly
+    use halo2_proofs::arithmetic::{eval_polynomial, lagrange_interpolate};
+    let secret2 = eval_polynomial(&lagrange_interpolate(&xs, &evals), omega2);
+    println!("secret = {secret2:?}");
+    assert_eq!(secret, secret2);
+
+    println!("Hash(secret, 0) = {:?}", poseidon_hash2(secret, Fr::zero()));
+    println!("commitment_0    = {:?}", commitments[0]);
+    println!("commitment_1    = {:?}", commitments[1]);
+
+    // Recover the nonces
+    let omega = pk.get_vk().get_domain().get_omega();
+    let mut xs_for_nonce: Vec<Fr> = (0..64).map(|e| omega.pow_vartime([e])).collect();
+    let mut evals_for_nonce = vec![Fr::zero(); 64];
+    evals_for_nonce[0] = secret;
+    evals_for_nonce[63] = Fr::one();
+    for i in 0..64 {
+        let (x, evals_at_x) = halo2_proofs::plonk::verifier::extract_info_from_proof::<
+            _,
+            VerifierSHPLONK<_>,
+            _,
+            _,
+            _,
+        >(
+            params.verifier_params(),
+            pk.get_vk(),
+            AccumulatorStrategy::new(params.verifier_params()),
+            &[&[&[nullifiers[i], commitments[i]]]],
+            &mut Blake2bRead::<_, _, Challenge255<_>>::init(proofs[i].as_slice()),
+        )
+        .unwrap();
+
+        // Replace the unknown evaluation at omega with the known one at x
+        xs_for_nonce[1] = x;
+        evals_for_nonce[1] = evals_at_x[0];
+        let nonce = eval_polynomial(
+            &lagrange_interpolate(&xs_for_nonce, &evals_for_nonce),
+            omega,
+        );
+        println!("nonce_{i:<2} = {:?}", nonce);
+        assert_eq!(poseidon_hash2(secret, nonce), nullifiers[i]);
+    }
 
     assert_eq!(
         secret,

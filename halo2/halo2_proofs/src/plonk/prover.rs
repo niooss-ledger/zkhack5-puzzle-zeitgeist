@@ -506,6 +506,40 @@ where
                     advice_values[idx] = Scheme::Scalar::ONE;
                 }
 
+                // Display advice_values
+                /*
+                for (col, values) in advice_values.iter().enumerate() {
+                    println!("advice_values[{col}] = {values:?}");
+                }
+                */
+                for (col, values) in advice_values.iter().enumerate() {
+                    println!("advice_values[{col}] = [");
+                    for chunk in values.chunks(16) {
+                        println!(
+                            "  {}",
+                            chunk
+                                .iter()
+                                .map(|v| {
+                                    let v_formatted = format!("{v:?}");
+                                    if &v_formatted == "0x0000000000000000000000000000000000000000000000000000000000000000" {
+                                        "0"
+                                    } else if &v_formatted == "0x0000000000000000000000000000000000000000000000000000000000000001" {
+                                        "1"
+                                    } else if &v_formatted == "0x0000000000000000000000000000000000000000000000000000000005ecc0de" {
+                                        "secret"
+                                    } else if &v_formatted == "0x0000000000000000000000000000000000000000000000000000000000000ace" {
+                                        "nonce"
+                                    } else {
+                                        "..."
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    println!("]");
+                }
+
                 // Compute commitments to advice column polynomials
                 let blinds: Vec<_> = advice_values
                     .iter()
@@ -735,6 +769,9 @@ where
     }
 
     // Compute and hash advice evals for each circuit instance
+    for (i, query) in meta.advice_queries.iter().enumerate() {
+        println!("meta.advice_queries[{i}] = {query:?}");
+    }
     for advice in advice.iter() {
         // Evaluate polynomials at omega^i x
         let advice_evals: Vec<_> = meta
@@ -747,6 +784,33 @@ where
                 )
             })
             .collect();
+
+        println!("x = {:?}", *x);
+        println!(
+            "advice_polys[1](x) = {:?}",
+            eval_polynomial(&advice.advice_polys[1], *x)
+        );
+        println!("advice_evals[1]    = {:?}", advice_evals[1]);
+
+        let omega = domain.get_omega();
+        println!("omega    = {:?}", omega);
+        println!("omega^64 = {:?}", omega.pow_vartime([64])); // Verify it is a root of unity
+        println!(
+            "advice_polys[1](omega^0) = {:?}",
+            eval_polynomial(&advice.advice_polys[1], omega.pow_vartime([0]))
+        );
+        println!(
+            "advice_polys[1](omega^1) = {:?}",
+            eval_polynomial(&advice.advice_polys[1], omega)
+        );
+        println!(
+            "advice_polys[1](omega^2) = {:?}",
+            eval_polynomial(&advice.advice_polys[1], omega.pow_vartime([2]))
+        );
+        println!(
+            "advice_polys[1](omega^3) = {:?}",
+            eval_polynomial(&advice.advice_polys[1], omega.pow_vartime([3]))
+        );
 
         // Hash each advice column evaluation
         for eval in advice_evals.iter() {
